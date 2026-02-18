@@ -1,0 +1,46 @@
+# ===============================
+# IDE / Editor configs
+# ===============================
+.idea/
+.vscode/
+
+# ===============================
+# Python environment
+# ===============================
+.venv/
+venv/
+env/
+
+# ===============================
+# Python cache
+# ===============================
+__pycache__/
+*.pyc
+
+# ===============================
+# Environment files
+# ===============================
+.env
+
+# ===============================
+# RAG / Vector DB (tracked)
+# ===============================
+# Keep these
+# rag/vector_db/
+# eval_rag/chroma_db/
+
+# Ignore temp/cache inside RAG
+rag/__pycache__/
+rag/moot_rag/data/
+rag/moot_rag/retrieval/__pycache__/
+
+eval_rag/data/
+eval_rag/retrieval/__pycache__/
+
+# ===============================
+# Misc / generated files
+# ===============================
+*.sqlite3
+*.db
+*.bin
+*.pkl
