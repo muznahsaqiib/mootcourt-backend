@@ -14,6 +14,10 @@ from app.routes.auth import get_current_user
 from app.database.mongodb import live_sessions_collection, judge_questions_collection
 from eval_rag.evaluator.rubric import RUBRIC_TEXT
 from rag.moot_rag.run_rag import run_opponent_rag
+import shutil
+from fastapi import UploadFile, File
+from rag.moot_rag.audio.stt import speech_to_text
+from rag.moot_rag.audio.tts import text_to_speech
 from eval_rag.api.main import call_llm
 from eval_rag.evaluator.prompt_builder import build_prompt
 from eval_rag.retrieval.retriever import retrieve_context
@@ -295,4 +299,42 @@ async def evaluate_user_only(session_id: str, current_user=Depends(get_current_u
             "scores": scores,
             "overall_feedback": overall_feedback
         }
+    }
+
+
+
+
+@router.post("/petitioner/argument/audio")
+async def petitioner_argument_audio(
+    session_id: str,
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user)
+):
+    session = await get_session_by_id(session_id, current_user["_id"])
+    if session["current_party"] != "PETITIONER":
+        raise HTTPException(400, "Not petitioner's turn")
+
+    temp_path = f"temp_{session_id}.wav"
+    with open(temp_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    text = speech_to_text(temp_path)
+
+    await live_sessions_collection.update_one(
+        {"_id": session["_id"]},
+        {"$set": {"original_petitioner_argument": text}}
+    )
+
+    await push_history(session_id, current_user["_id"], "petitioner", text, type="argument")
+
+    judge_q = await get_judge_question(session["case_type"])
+    if judge_q:
+        await push_history(session_id, current_user["_id"], "judge", judge_q)
+
+    await set_turn(session_id, "PETITIONER_REPLY_TO_JUDGE", "PETITIONER")
+
+    return {
+        "transcribed_text": text,
+        "judge_question": judge_q,
+        "next_turn": "PETITIONER_REPLY_TO_JUDGE"
     }
