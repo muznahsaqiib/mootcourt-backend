@@ -1,3 +1,6 @@
+
+import io
+
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
@@ -7,8 +10,13 @@ import random
 import asyncio
 import logging
 
-logging.basicConfig(level=logging.INFO)
+import subprocess
+from fastapi import UploadFile, File, HTTPException, Depends
+
 logger = logging.getLogger(__name__)
+
+logging.basicConfig(level=logging.INFO)
+
 
 from app.routes.auth import get_current_user
 from app.database.mongodb import live_sessions_collection, judge_questions_collection
@@ -301,9 +309,6 @@ async def evaluate_user_only(session_id: str, current_user=Depends(get_current_u
         }
     }
 
-
-
-
 @router.post("/petitioner/argument/audio")
 async def petitioner_argument_audio(
     session_id: str,
@@ -311,30 +316,113 @@ async def petitioner_argument_audio(
     current_user=Depends(get_current_user)
 ):
     session = await get_session_by_id(session_id, current_user["_id"])
+
     if session["current_party"] != "PETITIONER":
-        raise HTTPException(400, "Not petitioner's turn")
+        raise HTTPException(status_code=400, detail="Not petitioner's turn")
 
-    temp_path = f"temp_{session_id}.wav"
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    try:
+        # ===== 1️⃣ Read WEBM =====
+        webm_bytes = await file.read()
+        if not webm_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
-    text = speech_to_text(temp_path)
+        logger.info(f"[AUDIO] Received {file.filename}, size={len(webm_bytes)} bytes")
 
-    await live_sessions_collection.update_one(
-        {"_id": session["_id"]},
-        {"$set": {"original_petitioner_argument": text}}
-    )
+        # ===== 2️⃣ Convert WEBM → WAV =====
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i", "pipe:0",
+            "-ac", "1",
+            "-ar", "16000",
+            "-f", "wav",
+            "pipe:1"
+        ]
 
-    await push_history(session_id, current_user["_id"], "petitioner", text, type="argument")
+        process = subprocess.run(
+            ffmpeg_cmd,
+            input=webm_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True
+        )
 
-    judge_q = await get_judge_question(session["case_type"])
-    if judge_q:
-        await push_history(session_id, current_user["_id"], "judge", judge_q)
+        wav_bytes = process.stdout
+        if not wav_bytes:
+            raise HTTPException(status_code=500, detail="ffmpeg produced empty WAV")
 
-    await set_turn(session_id, "PETITIONER_REPLY_TO_JUDGE", "PETITIONER")
+        wav_stream = io.BytesIO(wav_bytes)
+        wav_stream.seek(0)
+
+        # ===== 3️⃣ Transcribe =====
+        text = speech_to_text(wav_stream)
+        if not text:
+            raise HTTPException(status_code=500, detail="Transcription failed")
+
+        logger.info(f"[AUDIO] Transcribed text: {text}")
+
+        # ===== 4️⃣ Store argument =====
+        await live_sessions_collection.update_one(
+            {"_id": session["_id"]},
+            {"$set": {"original_petitioner_argument": text}}
+        )
+
+        await push_history(
+            session_id,
+            current_user["_id"],
+            "petitioner",
+            text,
+            type="argument"
+        )
+
+        # ===== 5️⃣ Judge Question =====
+        judge_q = await get_judge_question(session["case_type"])
+        if judge_q:
+            await push_history(session_id, current_user["_id"], "judge", judge_q)
+
+        # ===== 6️⃣ Respondent RAG Argument =====
+        response = await asyncio.to_thread(
+            run_opponent_rag,
+            case_key=session["case_id"],
+            argument=text,
+            history=session.get("history", [])
+        )
+
+        respondent_argument = response.get("response") if isinstance(response, dict) else str(response)
+
+        await push_history(
+            session_id,
+            current_user["_id"],
+            "respondent",
+            respondent_argument
+        )
+
+        # ===== 7️⃣ Convert Judge + Respondent to Speech =====
+        judge_audio_bytes = text_to_speech(judge_q) if judge_q else None
+        respondent_audio_bytes = text_to_speech(respondent_argument)
+
+        judge_audio_base64 = (
+            judge_audio_bytes.decode("latin1") if judge_audio_bytes else None
+        )
+        respondent_audio_base64 = respondent_audio_bytes.decode("latin1")
+
+        # ===== 8️⃣ Update Turn =====
+        await set_turn(session_id, "PETITIONER_REBUTTAL", "PETITIONER")
+
+    except subprocess.CalledProcessError as e:
+        error_msg = e.stderr.decode() if e.stderr else str(e)
+        logger.error(f"[AUDIO] ffmpeg failed: {error_msg}")
+        raise HTTPException(status_code=500, detail=f"Audio conversion failed: {error_msg}")
+
+    except Exception as e:
+        logger.exception("[AUDIO] Processing failed")
+        raise HTTPException(status_code=500, detail=f"Audio processing error: {str(e)}")
 
     return {
         "transcribed_text": text,
         "judge_question": judge_q,
-        "next_turn": "PETITIONER_REPLY_TO_JUDGE"
+        "respondent_argument": respondent_argument,
+        "judge_audio": judge_audio_base64,
+        "respondent_audio": respondent_audio_base64,
+        "next_turn": "PETITIONER_REBUTTAL"
     }
