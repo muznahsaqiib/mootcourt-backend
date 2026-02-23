@@ -2,7 +2,7 @@ import io
 import whisper
 import soundfile as sf
 import numpy as np
-
+import librosa
 model = whisper.load_model("base")  # load once globally
 
 def speech_to_text(wav_stream: io.BytesIO) -> str:
@@ -13,7 +13,6 @@ def speech_to_text(wav_stream: io.BytesIO) -> str:
 
     # Ensure 16kHz
     if sr != 16000:
-        import librosa
         audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
 
     # Convert to float32 (important for Whisper stability)

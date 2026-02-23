@@ -1,34 +1,27 @@
-
 import io
-
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
-from typing import Optional
-from datetime import datetime
-from bson import ObjectId
+import subprocess
+import logging
 import random
 import asyncio
-import logging
-
-import subprocess
-from fastapi import UploadFile, File, HTTPException, Depends
-
-logger = logging.getLogger(__name__)
-
-logging.basicConfig(level=logging.INFO)
-
-
+import os
+from datetime import datetime
+from typing import Optional
+from pydantic import BaseModel
+from bson import ObjectId
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form
+import base64
 from app.routes.auth import get_current_user
 from app.database.mongodb import live_sessions_collection, judge_questions_collection
-from eval_rag.evaluator.rubric import RUBRIC_TEXT
-from rag.moot_rag.run_rag import run_opponent_rag
-import shutil
-from fastapi import UploadFile, File
 from rag.moot_rag.audio.stt import speech_to_text
 from rag.moot_rag.audio.tts import text_to_speech
+from rag.moot_rag.run_rag import run_opponent_rag
+from eval_rag.evaluator.rubric import RUBRIC_TEXT
 from eval_rag.api.main import call_llm
 from eval_rag.evaluator.prompt_builder import build_prompt
 from eval_rag.retrieval.retriever import retrieve_context
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 router = APIRouter(prefix="/moot", tags=["Moot"])
 
@@ -44,7 +37,7 @@ class ArgumentRequest(BaseModel):
 async def get_session_by_id(session_id: str, user_id):
     session = await live_sessions_collection.find_one({
         "_id": ObjectId(session_id),
-        "user_id": user_id  # already ObjectId
+        "user_id": user_id
     })
     if not session:
         raise HTTPException(404, "Session not found")
@@ -81,7 +74,7 @@ async def get_judge_question(case_type: str):
 @router.post("/initiate")
 async def initiate(req: SessionRequest, current_user=Depends(get_current_user)):
     session = {
-        "user_id": current_user["_id"],  # store ObjectId directly
+        "user_id": current_user["_id"],
         "case_id": req.case_id,
         "case_type": req.case_type,
         "history": [],
@@ -100,21 +93,143 @@ async def transcript(session_id: str, current_user=Depends(get_current_user)):
     session = await get_session_by_id(session_id, current_user["_id"])
     return session.get("history", [])
 
-# ================= PETITIONER =================
+# ================= AUDIO UTILITY =================
+async def process_audio(file: UploadFile) -> str:
+    """Convert uploaded audio to WAV and transcribe"""
+    webm_bytes = await file.read()
+
+    if not webm_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
+        "-i", "pipe:0",
+        "-ac", "1",
+        "-ar", "16000",
+        "-f", "wav",
+        "pipe:1"
+    ]
+
+    try:
+        process = subprocess.run(
+            ffmpeg_cmd,
+            input=webm_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True
+        )
+
+        wav_bytes = process.stdout
+        wav_stream = io.BytesIO(wav_bytes)
+        wav_stream.seek(0)
+
+        # ✅ run STT in thread since it's blocking
+        text = await asyncio.to_thread(speech_to_text, wav_stream)
+
+        if not text:
+            raise HTTPException(status_code=500, detail="STT transcription failed")
+
+        return text
+
+    except subprocess.CalledProcessError as e:
+        err_msg = e.stderr.decode() if e.stderr else str(e)
+        raise HTTPException(status_code=500, detail=f"ffmpeg failed: {err_msg}")
+
+def _tts_output_to_bytes(tts_output) -> bytes:
+    """
+    Normalize TTS output into raw audio bytes.
+    text_to_speech may return bytes directly or a file path.
+    """
+    if tts_output is None:
+        return b""
+
+    if isinstance(tts_output, (bytes, bytearray, memoryview)):
+        return bytes(tts_output)
+
+    if isinstance(tts_output, str):
+        if not os.path.exists(tts_output):
+            raise HTTPException(status_code=500, detail=f"TTS file not found: {tts_output}")
+        with open(tts_output, "rb") as f:
+            return f.read()
+
+    raise HTTPException(
+        status_code=500,
+        detail=f"Unexpected TTS output type: {type(tts_output).__name__}"
+    )
+# ================= PETITIONER AUDIO FLOW =================
+async def petitioner_audio_flow(file: UploadFile, session_id: str, current_user):
+    # 1️⃣ Fetch session
+    session = await get_session_by_id(session_id, current_user["_id"])
+    if session["current_party"] != "PETITIONER":
+        raise HTTPException(status_code=400, detail="Not petitioner's turn")
+
+    # 2️⃣ Convert audio to WAV and transcribe
+    text = await process_audio(file)
+
+    # 3️⃣ Push petitioner's argument to history
+    await push_history(
+        session_id,
+        current_user["_id"],
+        "petitioner",
+        text,
+        type="argument"
+    )
+
+    # 4️⃣ Get judge question (if any)
+    judge_q = await get_judge_question(session["case_type"])
+    if judge_q:
+        await push_history(session_id, current_user["_id"], "judge", judge_q)
+
+    # 5️⃣ Generate respondent RAG response in a thread
+    response = await asyncio.to_thread(
+        run_opponent_rag,
+        case_key=session["case_id"],
+        argument=text,
+        history=session.get("history", [])
+    )
+
+    respondent_arg = response.get("response") if isinstance(response, dict) else str(response)
+    await push_history(session_id, current_user["_id"], "respondent", respondent_arg)
+
+    # 6️⃣ Convert Judge question & Respondent response to audio (TTS)
+    # Ensure text_to_speech returns bytes
+    judge_tts_output = await asyncio.to_thread(text_to_speech, judge_q) if judge_q else None
+    respondent_tts_output = await asyncio.to_thread(text_to_speech, respondent_arg)
+    judge_audio_bytes = _tts_output_to_bytes(judge_tts_output) if judge_tts_output else None
+    respondent_audio_bytes = _tts_output_to_bytes(respondent_tts_output)
+
+    # 7️⃣ Encode audio as Base64 for frontend
+    judge_audio_b64 = base64.b64encode(judge_audio_bytes).decode() if judge_audio_bytes else None
+    respondent_audio_b64 = base64.b64encode(respondent_audio_bytes).decode()
+
+    # 8️⃣ Update next turn
+    await set_turn(session_id, "PETITIONER_REBUTTAL", "PETITIONER")
+
+    # 9️⃣ Return all results
+    return {
+        "transcribed_text": text,
+        "judge_question": judge_q,
+        "respondent_argument": respondent_arg,
+        "judge_audio": judge_audio_b64,
+        "respondent_audio": respondent_audio_b64,
+        "next_turn": "PETITIONER_REBUTTAL"
+    }
+@router.post("/petitioner/argument/audio")
+async def petitioner_argument_audio(
+    session_id: str = Form(...),
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user)
+):
+    return await petitioner_audio_flow(file, session_id, current_user)
+
+# ================= PETITIONER TEXT FLOW =================
 @router.post("/petitioner/argument")
 async def petitioner_argument(req: ArgumentRequest, session_id: str, current_user=Depends(get_current_user)):
     session = await get_session_by_id(session_id, current_user["_id"])
     if session["current_party"] != "PETITIONER":
         raise HTTPException(400, "Not petitioner's turn")
 
-    # Save original argument
-    await live_sessions_collection.update_one(
-        {"_id": session["_id"]},
-        {"$set": {"original_petitioner_argument": req.text or ""}}
-    )
     await push_history(session_id, current_user["_id"], "petitioner", req.text or "", type="argument")
-
-    # Judge question
     judge_q = await get_judge_question(session["case_type"])
     if judge_q:
         await push_history(session_id, current_user["_id"], "judge", judge_q)
@@ -122,15 +237,122 @@ async def petitioner_argument(req: ArgumentRequest, session_id: str, current_use
     await set_turn(session_id, "PETITIONER_REPLY_TO_JUDGE", "PETITIONER")
     return {"judge_question": judge_q, "next_turn": "PETITIONER_REPLY_TO_JUDGE"}
 
+# ================= PETITIONER REPLY =================
 @router.post("/petitioner/reply")
 async def petitioner_reply(req: ArgumentRequest, session_id: str, current_user=Depends(get_current_user)):
     session = await get_session_by_id(session_id, current_user["_id"])
     if session["current_party"] != "PETITIONER":
         raise HTTPException(400, "Not petitioner's turn")
-
     await push_history(session_id, current_user["_id"], "petitioner", req.text or "", type="reply_to_judge")
     await set_turn(session_id, "RESPONDENT_RAG", "RESPONDENT")
     return {"next_turn": "RESPONDENT_RAG"}
+
+@router.post("/petitioner/reply/audio")
+async def petitioner_reply_audio(
+    session_id: str = Form(...),
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user)
+):
+    session = await get_session_by_id(session_id, current_user["_id"])
+
+    if session["current_party"] != "PETITIONER":
+        raise HTTPException(status_code=400, detail="Not petitioner's turn")
+
+    # -------- STT --------
+    text = await process_audio(file)
+
+    await push_history(
+        session_id,
+        current_user["_id"],
+        "petitioner",
+        text,
+        type="reply_to_judge"
+    )
+
+    # -------- Respondent RAG --------
+    response = await asyncio.to_thread(
+        run_opponent_rag,
+        case_key=session["case_id"],
+        argument=text,
+        history=session.get("history", [])
+    )
+
+    respondent_reply = (
+        response.get("response")
+        if isinstance(response, dict)
+        else str(response)
+    )
+
+    await push_history(
+        session_id,
+        current_user["_id"],
+        "respondent",
+        respondent_reply
+    )
+
+    # -------- TTS --------
+    respondent_tts_output = await asyncio.to_thread(text_to_speech, respondent_reply)
+    respondent_audio = _tts_output_to_bytes(respondent_tts_output)
+    respondent_audio_b64 = base64.b64encode(respondent_audio).decode()
+
+    await set_turn(session_id, "PETITIONER_REBUTTAL", "PETITIONER")
+
+    return {
+        "transcribed_text": text,
+        "respondent_reply": respondent_reply,
+        "respondent_audio": respondent_audio_b64,
+        "next_turn": "PETITIONER_REBUTTAL"
+    }
+
+    # # Respondent RAG response
+    # response = await asyncio.to_thread(run_opponent_rag, case_key=session["case_id"], argument=text, history=session.get("history", []))
+    # respondent_reply = response.get("response") if isinstance(response, dict) else str(response)
+    # await push_history(session_id, current_user["_id"], "respondent", respondent_reply)
+
+    # # TTS
+    # respondent_audio = text_to_speech(respondent_reply)
+    # respondent_audio_b64 = respondent_audio.decode("latin1")
+
+    # await set_turn(session_id, "PETITIONER_REBUTTAL", "PETITIONER")
+    # return {"transcribed_text": text, "respondent_reply": respondent_reply, "respondent_audio": respondent_audio_b64, "next_turn": "PETITIONER_REBUTTAL"}
+
+# ================= PETITIONER REBUT =================
+@router.post("/petitioner/rebut")
+async def petitioner_rebut(req: ArgumentRequest, session_id: str, current_user=Depends(get_current_user)):
+    session = await get_session_by_id(session_id, current_user["_id"])
+    if session["current_party"] != "PETITIONER":
+        raise HTTPException(400, "Not petitioner's turn")
+    await push_history(session_id, current_user["_id"], "petitioner", req.text or "", type="rebuttal")
+    await set_turn(session_id, "SESSION_END", None)
+    return {"next_turn": "SESSION_END"}
+
+@router.post("/petitioner/rebut/audio")
+async def petitioner_rebut_audio(
+    session_id: str = Form(...),
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user)
+):
+    session = await get_session_by_id(session_id, current_user["_id"])
+
+    if session["current_party"] != "PETITIONER":
+        raise HTTPException(status_code=400, detail="Not petitioner's turn")
+
+    text = await process_audio(file)
+
+    await push_history(
+        session_id,
+        current_user["_id"],
+        "petitioner",
+        text,
+        type="rebuttal"
+    )
+
+    await set_turn(session_id, "SESSION_END", None)
+
+    return {
+        "transcribed_text": text,
+        "next_turn": "SESSION_END"
+    }
 
 # ================= RESPONDENT RAG =================
 @router.post("/respondent/rag")
@@ -138,13 +360,10 @@ async def respondent_rag(session_id: str, current_user=Depends(get_current_user)
     session = await get_session_by_id(session_id, current_user["_id"])
     original_arg = session.get("original_petitioner_argument", "")
     history = session.get("history", [])
-
-    # Generate AI argument
     response = await asyncio.to_thread(run_opponent_rag, case_key=session["case_id"], argument=original_arg, history=history)
     respondent_argument = response.get("response") if isinstance(response, dict) else str(response)
     await push_history(session_id, current_user["_id"], "respondent", respondent_argument)
 
-    # Judge question & AI reply
     judge_q = await get_judge_question(session["case_type"])
     if judge_q:
         await push_history(session_id, current_user["_id"], "judge", judge_q)
@@ -156,54 +375,22 @@ async def respondent_rag(session_id: str, current_user=Depends(get_current_user)
         respondent_reply = None
 
     await set_turn(session_id, "PETITIONER_REBUTTAL", "PETITIONER")
-    return {
-        "respondent_argument": respondent_argument,
-        "judge_question": judge_q,
-        "respondent_reply": respondent_reply,
-        "next_turn": "PETITIONER_REBUTTAL"
-    }
-
-# ================= PETITIONER REBUTTAL =================
-@router.post("/petitioner/rebut")
-async def petitioner_rebut(req: ArgumentRequest, session_id: str, current_user=Depends(get_current_user)):
-    session = await get_session_by_id(session_id, current_user["_id"])
-    if session["current_party"] != "PETITIONER":
-        raise HTTPException(400, "Not petitioner's turn")
-
-    await push_history(session_id, current_user["_id"], "petitioner", req.text or "", type="rebuttal")
-    await set_turn(session_id, "SESSION_END", None)
-    return {"next_turn": "SESSION_END"}
+    return {"respondent_argument": respondent_argument, "judge_question": judge_q, "respondent_reply": respondent_reply, "next_turn": "PETITIONER_REBUTTAL"}
 
 # ================= EVALUATION =================
 @router.post("/evaluate")
 async def evaluate_user_only(session_id: str, current_user=Depends(get_current_user)):
-    logger.info("🔍 Starting evaluation...")
-    logger.info(f"Session ID: {session_id}")
-    logger.info(f"User ID: {current_user['_id']}")
-
     session = await get_session_by_id(session_id, current_user["_id"])
-
     if session.get("next_turn") != "SESSION_END":
-        logger.warning("❌ Session not ended yet")
         raise HTTPException(400, "Session not ended yet")
 
     history = session.get("history", [])
-    logger.info(f"History length: {len(history)}")
-
     main_argument, judge_responses, rebuttals = [], [], []
 
     for idx, h in enumerate(history):
-        logger.info(f"Processing history item {idx}: {h}")
-
         if h.get("role") != "petitioner":
             continue
-
-        t = h.get("type") or (
-            "argument" if idx == 0 else
-            "rebuttal" if idx == len(history)-1 else
-            "reply_to_judge"
-        )
-
+        t = h.get("type") or ("argument" if idx == 0 else "rebuttal" if idx == len(history)-1 else "reply_to_judge")
         if t == "argument":
             main_argument.append(h.get("text", ""))
         elif t == "reply_to_judge":
@@ -215,214 +402,30 @@ async def evaluate_user_only(session_id: str, current_user=Depends(get_current_u
     judge_response_text = "\n\n".join(judge_responses)
     rebuttal_text = "\n\n".join(rebuttals)
 
-    logger.info("Main Argument Extracted:")
-    logger.info(main_argument_text)
+    last_judge_q = next((h["text"] for h in reversed(history) if h.get("role")=="judge"), "")
+    last_respondent_arg = next((h["text"] for h in reversed(history) if h.get("role")=="respondent"), "")
 
-    logger.info("Judge Responses Extracted:")
-    logger.info(judge_response_text)
+    retrieved_context_text = retrieve_context(main_argument_text, last_judge_q, session.get("case_type", "default"))
 
-    logger.info("Rebuttal Extracted:")
-    logger.info(rebuttal_text)
-
-    last_judge_q = next(
-        (h["text"] for h in reversed(history) if h.get("role") == "judge"),
-        ""
-    )
-
-    last_respondent_arg = next(
-        (h["text"] for h in reversed(history) if h.get("role") == "respondent"),
-        ""
-    )
-
-    logger.info(f"Last Judge Question: {last_judge_q}")
-    logger.info(f"Last Respondent Argument: {last_respondent_arg}")
-
-    retrieved_context_text = retrieve_context(
-        main_argument=main_argument_text,
-        judge_question=last_judge_q,
-        case_type=session.get("case_type", "default")
-    )
-
-    logger.info("Retrieved Context:")
-    logger.info(retrieved_context_text)
-
-    prompt = build_prompt(
-        main_argument=main_argument_text,
-        judge_question=last_judge_q,
-        user_judge_answer=judge_response_text,
-        opponent_argument=last_respondent_arg,
-        user_rebuttal=rebuttal_text,
-        rubric_text=RUBRIC_TEXT,
-        retrieved_context=retrieved_context_text
-    )
-
-    logger.info("Final Prompt Sent To LLM:")
-    logger.info(prompt)
-
+    prompt = build_prompt(main_argument_text, last_judge_q, judge_response_text, last_respondent_arg, rebuttal_text, RUBRIC_TEXT, retrieved_context_text)
     raw_eval_result = await asyncio.to_thread(call_llm, prompt)
 
-    logger.info("Raw LLM Response:")
-    logger.info(raw_eval_result)
-
-    # Parse evaluator output
     import re, json
     scores = {}
     overall_feedback = "Evaluation completed."
-
     if raw_eval_result:
         if isinstance(raw_eval_result, dict):
             eval_obj = raw_eval_result
         else:
             match = re.search(r"\{.*\}", str(raw_eval_result), re.DOTALL)
             eval_obj = json.loads(match.group()) if match else None
-
-        logger.info(f"Parsed Evaluation Object: {eval_obj}")
-
         if eval_obj:
             scores = eval_obj.get("scores", {})
             overall_feedback = eval_obj.get("overall_feedback", overall_feedback)
 
-    logger.info(f"Final Scores: {scores}")
-    logger.info(f"Overall Feedback: {overall_feedback}")
-
     await live_sessions_collection.update_one(
         {"_id": session["_id"]},
-        {"$push": {
-            "evaluation_history": {
-                "party": "petitioner",
-                "timestamp": datetime.utcnow(),
-                "evaluation": {
-                    "scores": scores,
-                    "overall_feedback": overall_feedback
-                }
-            }
-        }}
+        {"$push": {"evaluation_history": {"party":"petitioner","timestamp":datetime.utcnow(),"evaluation":{"scores":scores,"overall_feedback":overall_feedback}}}}
     )
 
-    logger.info("✅ Evaluation saved successfully")
-
-    return {
-        "session_id": str(session["_id"]),
-        "evaluation": {
-            "scores": scores,
-            "overall_feedback": overall_feedback
-        }
-    }
-
-@router.post("/petitioner/argument/audio")
-async def petitioner_argument_audio(
-    session_id: str,
-    file: UploadFile = File(...),
-    current_user=Depends(get_current_user)
-):
-    session = await get_session_by_id(session_id, current_user["_id"])
-
-    if session["current_party"] != "PETITIONER":
-        raise HTTPException(status_code=400, detail="Not petitioner's turn")
-
-    try:
-        # ===== 1️⃣ Read WEBM =====
-        webm_bytes = await file.read()
-        if not webm_bytes:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty")
-
-        logger.info(f"[AUDIO] Received {file.filename}, size={len(webm_bytes)} bytes")
-
-        # ===== 2️⃣ Convert WEBM → WAV =====
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-y",
-            "-i", "pipe:0",
-            "-ac", "1",
-            "-ar", "16000",
-            "-f", "wav",
-            "pipe:1"
-        ]
-
-        process = subprocess.run(
-            ffmpeg_cmd,
-            input=webm_bytes,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True
-        )
-
-        wav_bytes = process.stdout
-        if not wav_bytes:
-            raise HTTPException(status_code=500, detail="ffmpeg produced empty WAV")
-
-        wav_stream = io.BytesIO(wav_bytes)
-        wav_stream.seek(0)
-
-        # ===== 3️⃣ Transcribe =====
-        text = speech_to_text(wav_stream)
-        if not text:
-            raise HTTPException(status_code=500, detail="Transcription failed")
-
-        logger.info(f"[AUDIO] Transcribed text: {text}")
-
-        # ===== 4️⃣ Store argument =====
-        await live_sessions_collection.update_one(
-            {"_id": session["_id"]},
-            {"$set": {"original_petitioner_argument": text}}
-        )
-
-        await push_history(
-            session_id,
-            current_user["_id"],
-            "petitioner",
-            text,
-            type="argument"
-        )
-
-        # ===== 5️⃣ Judge Question =====
-        judge_q = await get_judge_question(session["case_type"])
-        if judge_q:
-            await push_history(session_id, current_user["_id"], "judge", judge_q)
-
-        # ===== 6️⃣ Respondent RAG Argument =====
-        response = await asyncio.to_thread(
-            run_opponent_rag,
-            case_key=session["case_id"],
-            argument=text,
-            history=session.get("history", [])
-        )
-
-        respondent_argument = response.get("response") if isinstance(response, dict) else str(response)
-
-        await push_history(
-            session_id,
-            current_user["_id"],
-            "respondent",
-            respondent_argument
-        )
-
-        # ===== 7️⃣ Convert Judge + Respondent to Speech =====
-        judge_audio_bytes = text_to_speech(judge_q) if judge_q else None
-        respondent_audio_bytes = text_to_speech(respondent_argument)
-
-        judge_audio_base64 = (
-            judge_audio_bytes.decode("latin1") if judge_audio_bytes else None
-        )
-        respondent_audio_base64 = respondent_audio_bytes.decode("latin1")
-
-        # ===== 8️⃣ Update Turn =====
-        await set_turn(session_id, "PETITIONER_REBUTTAL", "PETITIONER")
-
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr.decode() if e.stderr else str(e)
-        logger.error(f"[AUDIO] ffmpeg failed: {error_msg}")
-        raise HTTPException(status_code=500, detail=f"Audio conversion failed: {error_msg}")
-
-    except Exception as e:
-        logger.exception("[AUDIO] Processing failed")
-        raise HTTPException(status_code=500, detail=f"Audio processing error: {str(e)}")
-
-    return {
-        "transcribed_text": text,
-        "judge_question": judge_q,
-        "respondent_argument": respondent_argument,
-        "judge_audio": judge_audio_base64,
-        "respondent_audio": respondent_audio_base64,
-        "next_turn": "PETITIONER_REBUTTAL"
-    }
+    return {"session_id": str(session["_id"]), "evaluation":{"scores":scores,"overall_feedback":overall_feedback}}
