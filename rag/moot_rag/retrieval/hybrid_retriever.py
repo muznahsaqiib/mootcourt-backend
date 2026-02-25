@@ -5,6 +5,18 @@ from typing import List, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+def _where_case(case_key: str, case_type: str = None) -> Dict[str, Any]:
+    """Chroma where must use exactly one operator; use $eq and $and for multiple conditions."""
+    if case_type:
+        return {"$and": [{"case_key": {"$eq": case_key}}, {"case_type": {"$eq": case_type}}]}
+    return {"case_key": {"$eq": case_key}}
+
+
+def _where_source_type(source_type: str) -> Dict[str, Any]:
+    return {"source_type": {"$eq": source_type}}
+
+
 class HybridRetriever:
     """
     Hybrid Retriever with full context:
@@ -43,39 +55,34 @@ class HybridRetriever:
     def _load_case_docs(self):
         logger.info(f"[HybridRetriever] Loading docs for case_key={self.case_key} case_type={self.case_type}")
 
-        filters = {"case_key": self.case_key}
-        if self.case_type:
-            filters["case_type"] = self.case_type
-
-        res = self.collection.get(
-            where=filters,
-            include=["documents", "metadatas"]
-        )
+        where_case = _where_case(self.case_key, self.case_type)
+        res = self.collection.get(where=where_case)
 
         documents = res.get("documents", []) if res else []
         metadatas = res.get("metadatas", []) if res else []
+        ids = res.get("ids", []) if res else []
 
-        # Include legal docs
         if self.include_legal_docs:
-            legal_res = self.collection.get(
-                where={"source_type": "law"},
-                include=["documents", "metadatas"]
-            )
-
+            legal_res = self.collection.get(where=_where_source_type("law"))
             if legal_res and legal_res.get("documents"):
                 documents += legal_res["documents"]
-                metadatas += legal_res["metadatas"]
+                metadatas += legal_res.get("metadatas", [])
+                ids += legal_res.get("ids", [])
 
         if not documents:
             logger.warning(f"No documents found for case_key={self.case_key}")
             return
 
-        # Clean texts
-        self.doc_texts = [d.strip() for d in documents]
-        self.doc_metadatas = metadatas
-
-        # 🔥 Generate stable local IDs (fixes index mismatch permanently)
-        self.doc_ids = [f"doc_{i}" for i in range(len(self.doc_texts))]
+        n = len(documents)
+        self.doc_texts = [d.strip() if isinstance(d, str) else "" for d in documents]
+        self.doc_metadatas = []
+        for i in range(n):
+            self.doc_metadatas.append(metadatas[i] if i < len(metadatas) and isinstance(metadatas[i], dict) else {})
+        if len(ids) == n:
+            self.doc_ids = [str(i) for i in ids]
+        else:
+            self.doc_ids = [f"doc_{i}" for i in range(n)]
+            logger.warning("[HybridRetriever] ids length mismatch, using synthetic ids; dense may not align.")
 
         # Build BM25
         tokenized_docs = [doc.lower().split() for doc in self.doc_texts]
@@ -94,25 +101,35 @@ class HybridRetriever:
         logger.info(f"[HybridRetriever] Query: {query[:100]}")
 
         # ----------------------
-        # Dense retrieval
+        # Dense retrieval (case + legal so both get scores)
         # ----------------------
         query_embedding = self.embed_fn([query])[0]
+        n_dense = max(self.top_k * 3, 30)
+        case_where = _where_case(self.case_key, self.case_type)
 
-        dense_res = self.collection.query(
-        query_embeddings=[query_embedding],
-        where={"case_key": self.case_key} if not self.case_type else {
-            "case_key": self.case_key,
-            "case_type": self.case_type
-        },
-        n_results=max(self.top_k * 3, 30),
-        include=["documents", "metadatas", "distances"]  # ❌ remove "ids"
-    )
-
+        case_dense = self.collection.query(
+            query_embeddings=[query_embedding],
+            where=case_where,
+            n_results=n_dense,
+            include=["distances"],
+        )
         dense_scores = {}
-        if dense_res and dense_res.get("ids"):
-            for i, doc_id in enumerate(dense_res["ids"][0]):
-                similarity = 1 - dense_res["distances"][0][i]
-                dense_scores[doc_id] = similarity
+        if case_dense and case_dense.get("ids") and case_dense.get("distances"):
+            for i, doc_id in enumerate(case_dense["ids"][0]):
+                sim = 1 - float(case_dense["distances"][0][i])
+                dense_scores[str(doc_id)] = max(dense_scores.get(str(doc_id), 0), sim)
+
+        if self.include_legal_docs:
+            law_dense = self.collection.query(
+                query_embeddings=[query_embedding],
+                where=_where_source_type("law"),
+                n_results=max(self.top_k, 15),
+                include=["distances"],
+            )
+            if law_dense and law_dense.get("ids") and law_dense.get("distances"):
+                for i, doc_id in enumerate(law_dense["ids"][0]):
+                    sim = 1 - float(law_dense["distances"][0][i])
+                    dense_scores[str(doc_id)] = max(dense_scores.get(str(doc_id), 0), sim)
 
         # normalize dense scores
         if dense_scores:

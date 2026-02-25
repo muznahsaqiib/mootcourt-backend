@@ -185,7 +185,8 @@ async def petitioner_audio_flow(file: UploadFile, session_id: str, current_user)
         run_opponent_rag,
         case_key=session["case_id"],
         argument=text,
-        history=session.get("history", [])
+        history=session.get("history", []),
+        case_type=session.get("case_type"),
     )
 
     respondent_arg = response.get("response") if isinstance(response, dict) else str(response)
@@ -274,7 +275,8 @@ async def petitioner_reply_audio(
         run_opponent_rag,
         case_key=session["case_id"],
         argument=text,
-        history=session.get("history", [])
+        history=session.get("history", []),
+        case_type=session.get("case_type"),
     )
 
     respondent_reply = (
@@ -360,7 +362,7 @@ async def respondent_rag(session_id: str, current_user=Depends(get_current_user)
     session = await get_session_by_id(session_id, current_user["_id"])
     original_arg = session.get("original_petitioner_argument", "")
     history = session.get("history", [])
-    response = await asyncio.to_thread(run_opponent_rag, case_key=session["case_id"], argument=original_arg, history=history)
+    response = await asyncio.to_thread(run_opponent_rag, case_key=session["case_id"], argument=original_arg, history=history, case_type=session.get("case_type"))
     respondent_argument = response.get("response") if isinstance(response, dict) else str(response)
     await push_history(session_id, current_user["_id"], "respondent", respondent_argument)
 
@@ -368,7 +370,7 @@ async def respondent_rag(session_id: str, current_user=Depends(get_current_user)
     if judge_q:
         await push_history(session_id, current_user["_id"], "judge", judge_q)
         updated_session = await get_session_by_id(session_id, current_user["_id"])
-        reply_response = await asyncio.to_thread(run_opponent_rag, case_key=session["case_id"], argument=judge_q, history=updated_session["history"])
+        reply_response = await asyncio.to_thread(run_opponent_rag, case_key=session["case_id"], argument=judge_q, history=updated_session["history"], case_type=session.get("case_type"))
         respondent_reply = reply_response.get("response") if isinstance(reply_response, dict) else str(reply_response)
         await push_history(session_id, current_user["_id"], "respondent", respondent_reply)
     else:

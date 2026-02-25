@@ -13,4 +13,4 @@ def embed_fn(texts):
     Embed a list of texts using legal BERT.
     Returns a list of embedding vectors.
     """
-    return model.encode(texts, convert_to_numpy=True, show_progress_bar=True).tolist()
+    return model.encode(texts, convert_to_numpy=True, show_progress_bar=False).tolist()

@@ -7,7 +7,8 @@ load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 def generate_rebuttal(argument, context, party="respondent"):
-    print(f"DEBUG: Generating rebuttal for party={party}, argument length={len(argument)}, context length={len(context)}")
+    import logging
+    logging.getLogger(__name__).debug("Generating rebuttal party=%s arg_len=%d ctx_len=%d", party, len(argument), len(context))
     prompt = f"""
 Much obliged, My Lord(s).
 
@@ -43,11 +44,12 @@ STRICT CONSTRAINTS
 ========================
 1. Produce 25-35 concise spoken lines only.
 2. Each line must ATTACK a specific petitioner claim tied to case facts.
-3. MUST cite specific precedents that FAVOR Respondent from context.
+3. Cite ONLY sources from the LEGAL CONTEXT using the exact ID shown, e.g. [SOURCE <id>].
 4. MUST reference specific amounts, dates, facts from petitioner's argument.
 5. Every rebuttal point should argue AGAINST petitioner, FOR Respondent.
 6. Use adversarial language: dispute, contradict, defeat, refute petitioner.
 7. Do NOT acknowledge petitioner's position as valid.
+8. Do NOT invent case names or statutes—cite only SOURCE ids from the context.
 
 ========================
 REBUTTAL STRATEGY
@@ -72,7 +74,7 @@ ARGUMENT TO REBUT
 ========================
 DELIVER YOUR ORAL REBUTTAL
 ========================
-Begin now. Address the petitioner's SPECIFIC claims using the legal context provided. Reference specific cases, amounts, dates, and facts from the argument. Each line should target a specific weakness in their claim using the precedents provided.
+Begin now. Address the petitioner's SPECIFIC claims using the legal context provided. After key points add [SOURCE <id>] from the context. Reference specific amounts, dates, and facts from the argument.
 """
     try:
         res = client.chat.completions.create(
@@ -81,8 +83,8 @@ Begin now. Address the petitioner's SPECIFIC claims using the legal context prov
             max_tokens=900,
             temperature=0.25
         )
-        print(f"DEBUG: LLM response received, content length={len(res.choices[0].message.content)}")
         return res.choices[0].message.content
     except Exception as e:
-        print(f"DEBUG: LLM call failed: {str(e)}")
+        import logging
+        logging.getLogger(__name__).exception("LLM call failed")
         return f"Error generating rebuttal: {str(e)}. Please try again."
