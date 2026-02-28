@@ -4,11 +4,13 @@ import logging
 import random
 import asyncio
 import os
+import json
 from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel
 from bson import ObjectId
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form
+from fastapi.responses import StreamingResponse
 import base64
 from app.routes.auth import get_current_user
 from app.database.mongodb import live_sessions_collection, judge_questions_collection
@@ -81,7 +83,6 @@ async def get_judge_question(case_type: str):
 
 # ================= TTS HELPER =================
 async def generate_audio_b64(text: str, voice: str = "default") -> Optional[str]:
-    """Generate TTS and return base64 string, or None on failure."""
     if not text or not text.strip():
         return None
     try:
@@ -94,7 +95,6 @@ async def generate_audio_b64(text: str, voice: str = "default") -> Optional[str]
 
 # ================= AUDIO UTILITY =================
 async def process_audio(file: UploadFile) -> str:
-    """Convert uploaded audio to WAV and transcribe via STT."""
     webm_bytes = await file.read()
     if not webm_bytes:
         return ""
@@ -123,6 +123,12 @@ async def process_audio(file: UploadFile) -> str:
     except subprocess.CalledProcessError as e:
         logger.error(f"ffmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
         return ""
+
+
+# ================= SSE HELPER =================
+def sse_event(event: str, data: dict) -> str:
+    """Format a single SSE message."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
 # ================= SESSION =================
@@ -159,7 +165,6 @@ async def petitioner_argument(req: ArgumentRequest, session_id: str, current_use
 
     text = req.text or ""
 
-    # Save original argument for RAG
     await live_sessions_collection.update_one(
         {"_id": ObjectId(session_id)},
         {"$set": {"original_petitioner_argument": text}}
@@ -200,7 +205,6 @@ async def petitioner_argument_audio(
             "next_turn": session.get("next_turn", "PETITIONER_ARGUMENT")
         }
 
-    # Save original argument for RAG
     await live_sessions_collection.update_one(
         {"_id": ObjectId(session_id)},
         {"$set": {"original_petitioner_argument": text}}
@@ -304,14 +308,125 @@ async def petitioner_rebut_audio(
     }
 
 
-# ================= RESPONDENT RAG =================
+# ================= RESPONDENT RAG (SSE STREAMING) =================
+@router.get("/respondent/rag/stream")
+async def respondent_rag_stream(session_id: str, current_user=Depends(get_current_user)):
+    """
+    Streams respondent RAG steps as SSE events so the frontend can render
+    each piece immediately instead of waiting for the full chain.
+
+    Event sequence:
+      1. respondent_argument  — RAG argument text + audio
+      2. judge_question       — judge question text + audio  (if any)
+      3. respondent_reply     — RAG reply to judge + audio   (if judge asked)
+      4. done                 — final next_turn signal
+    """
+    session = await get_session_by_id(session_id, current_user["_id"])
+
+    async def event_generator():
+        original_arg = session.get("original_petitioner_argument", "")
+        history = session.get("history", [])
+        case_id = session["case_id"]
+        case_type = session.get("case_type")
+
+        # ── STEP 1: Respondent RAG argument ──────────────────────────────
+        try:
+            rag_response = await asyncio.to_thread(
+                run_opponent_rag,
+                case_key=case_id,
+                argument=original_arg,
+                history=history,
+                case_type=case_type
+            )
+            respondent_argument = (
+                rag_response.get("response")
+                if isinstance(rag_response, dict)
+                else str(rag_response)
+            )
+        except Exception as e:
+            logger.error(f"Respondent RAG failed: {e}")
+            yield sse_event("error", {"message": "Respondent RAG failed."})
+            return
+
+        respondent_audio_b64 = await generate_audio_b64(respondent_argument, "respondent")
+
+        await push_history(session_id, current_user["_id"], "respondent",
+                           respondent_argument, audio_b64=respondent_audio_b64)
+
+        # ── Emit immediately so frontend shows respondent argument now ──
+        yield sse_event("respondent_argument", {
+            "text": respondent_argument,
+            "audio": respondent_audio_b64,
+        })
+
+        # ── STEP 2: Judge question ────────────────────────────────────────
+        judge_q = await get_judge_question(case_type)
+        judge_audio_b64 = None
+
+        if judge_q:
+            judge_audio_b64 = await generate_audio_b64(judge_q, "judge")
+            await push_history(session_id, current_user["_id"], "judge",
+                               judge_q, audio_b64=judge_audio_b64)
+
+            # ── Emit judge question so frontend shows it now ──
+            yield sse_event("judge_question", {
+                "text": judge_q,
+                "audio": judge_audio_b64,
+            })
+
+            # ── STEP 3: Respondent replies to judge ───────────────────────
+            updated_session = await get_session_by_id(session_id, current_user["_id"])
+            try:
+                reply_response = await asyncio.to_thread(
+                    run_opponent_rag,
+                    case_key=case_id,
+                    argument=judge_q,
+                    history=updated_session["history"],
+                    case_type=case_type
+                )
+                respondent_reply = (
+                    reply_response.get("response")
+                    if isinstance(reply_response, dict)
+                    else str(reply_response)
+                )
+            except Exception as e:
+                logger.error(f"Respondent reply RAG failed: {e}")
+                yield sse_event("error", {"message": "Respondent reply failed."})
+                return
+
+            respondent_reply_audio_b64 = await generate_audio_b64(respondent_reply, "respondent")
+            await push_history(session_id, current_user["_id"], "respondent",
+                               respondent_reply, audio_b64=respondent_reply_audio_b64)
+
+            # ── Emit respondent reply so frontend shows it now ──
+            yield sse_event("respondent_reply", {
+                "text": respondent_reply,
+                "audio": respondent_reply_audio_b64,
+            })
+
+        # ── STEP 4: Finalise turn ─────────────────────────────────────────
+        await set_turn(session_id, "PETITIONER_REBUTTAL", "PETITIONER")
+
+        yield sse_event("done", {"next_turn": "PETITIONER_REBUTTAL"})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # disables nginx buffering
+        }
+    )
+
+
+# ── Keep the old POST endpoint as a non-streaming fallback ──────────────────
 @router.post("/respondent/rag")
 async def respondent_rag(session_id: str, current_user=Depends(get_current_user)):
+    """Non-streaming fallback — waits for the full chain before returning."""
     session = await get_session_by_id(session_id, current_user["_id"])
     original_arg = session.get("original_petitioner_argument", "")
     history = session.get("history", [])
 
-    # Step 1: RAG + judge question fetch in parallel (independent)
     rag_task = asyncio.to_thread(
         run_opponent_rag,
         case_key=session["case_id"],
@@ -324,7 +439,6 @@ async def respondent_rag(session_id: str, current_user=Depends(get_current_user)
 
     respondent_argument = rag_response.get("response") if isinstance(rag_response, dict) else str(rag_response)
 
-    # Step 2: TTS for respondent arg + judge question in parallel
     async def _maybe_tts(text, voice):
         return await generate_audio_b64(text, voice) if text else None
 
@@ -333,7 +447,6 @@ async def respondent_rag(session_id: str, current_user=Depends(get_current_user)
         _maybe_tts(judge_q, "judge"),
     )
 
-    # Step 3: Push history
     await push_history(session_id, current_user["_id"], "respondent", respondent_argument,
                        audio_b64=respondent_audio_b64)
 
@@ -344,7 +457,6 @@ async def respondent_rag(session_id: str, current_user=Depends(get_current_user)
         await push_history(session_id, current_user["_id"], "judge", judge_q,
                            audio_b64=judge_audio_b64)
 
-        # Step 4: Respondent replies to judge question
         updated_session = await get_session_by_id(session_id, current_user["_id"])
         reply_response = await asyncio.to_thread(
             run_opponent_rag,
